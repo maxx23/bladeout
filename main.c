@@ -1,9 +1,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <signal.h>
-#include <unistd.h>
 #include <math.h>
 #include <string.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <time.h>
 #include <libbladeRF.h>
@@ -23,6 +23,8 @@
 #define DEFAULT_AGAIN		0.f
 #define DEFAULT_DEVICE_ID	""
 
+#define DEFAULT_READ_BLOCKSIZE	4096
+
 /* The conversion loop can be unrolled automatically by the compiler */
 #define UNROLL_FACTOR		8
 
@@ -40,6 +42,7 @@ struct cb_s
 	int16_t *data;					/* Actual buffer */
 	float *fbuf;					/* float buffer for conversion */
 	unsigned int size;				/* Number of elements */
+	unsigned int r_size;			/* Blocksize for fread() */
 	pthread_mutex_t lock;			/* For locking changes in r/w pointers */
 	pthread_cond_t e_cond;			/* Empty condition */
 	pthread_cond_t f_cond;			/* Full condition */
@@ -81,22 +84,23 @@ static int state = STATE_RUNNING;
 
 /* Display usage information
  */
-void usage(char *name, struct devinfo_s *dev)
+static void usage(char *name, struct devinfo_s *dev)
 {
 	fprintf(stderr, "%s <options>\n"
 		"\t-h\t\tShow this help text.\n"
 		"\t-d <device_id>\tDevice string (current: \"%s\").\n"
-		"\t-f <frequency>\tFrequency (current: %iHz).\n"
-		"\t-r <rate>\tSamplerate (current: %i).\n"
-		"\t-b <bandwidth>\tLPF bandwidth (current: %iHz).\n"
+		"\t-f <frequency>\tFrequency (current: %uHz).\n"
+		"\t-r <rate>\tSamplerate (current: %u).\n"
+		"\t-b <bandwidth>\tLPF bandwidth (current: %uHz).\n"
 		"\t-g <txvga1>\tGain for txvga1 (current: %idB).\n"
 		"\t-G <txvga2>\tGain for txvga2 (current: %idB).\n"
 		"\t-m <gain>\tSoft gain (current: %f).\n"
 		"\t-a <autogain>\tAuto gain adjustment (current: %f).\n"
-		"\t-p <prebuffer>\tPrebuffer size in (current: %i).\n"
-		"\t-n <buffers>\tNumber of buffers (current: %i).\n"
-		"\t-s <samples>\tSamples per buffer (current: %i).\n"
-		"\t-t <transfers>\tMaximum concurrent transfers (current: %i).\n"
+		"\t-p <prebuffer>\tCircular buffer size (current: %u).\n"
+		"\t-n <buffers>\tNumber of device buffers (current: %u).\n"
+		"\t-s <samples>\tSamples per buffer (current: %u).\n"
+		"\t-t <transfers>\tMaximum concurrent transfers (current: %u).\n"
+		"\t-R <blocksize>\tBlocksize for read operations (current: %u).\n"
 		"\n",
 		name,
 		dev->device_id,
@@ -110,7 +114,18 @@ void usage(char *name, struct devinfo_s *dev)
 		dev->buffers.cb.size,
 		dev->buffers.num_buffers,
 		dev->buffers.num_samples,
-		dev->buffers.num_transfers
+		dev->buffers.num_transfers,
+		dev->buffers.cb.r_size
+	);
+
+	fprintf(stderr, "Circular buffer size: %lukB.\n"
+		"Device buffer size: %lukB.\n"
+		"Float buffer size: %lukB.\n",
+		(dev->buffers.cb.size * dev->buffers.num_samples * 2
+			* sizeof(int16_t)) >> 10,
+		(dev->buffers.num_buffers * dev->buffers.num_samples * 2
+			* sizeof(int16_t)) >> 10,
+		(dev->buffers.num_samples * sizeof(float) * 2) >> 10
 	);
 }
 
@@ -203,7 +218,9 @@ static void *reader_proc(void *arg)
 	unsigned int tmp_r;
 	int16_t *ptr;
 	size_t nread;
-	int n, m;
+	unsigned int n, m;
+	const unsigned int n_blocks = sizeof(float) * 2
+		* buf->num_samples / cb->r_size;
 
 	while(!state)
 	{
@@ -222,10 +239,10 @@ static void *reader_proc(void *arg)
 			break;
 
 		/* Read the (float) samples */
-		nread = fread(cb->fbuf, sizeof(float) * 2,
-			buf->num_samples, stdin);
+		nread = fread(cb->fbuf, cb->r_size,
+			n_blocks, stdin);
 
-		if(nread < buf->num_samples)
+		if(nread < n_blocks)
 			fprintf(stderr, "WARNING: Short read.\n");
 		
 		/* Check a few conditions */
@@ -295,9 +312,9 @@ int main(int argc, char **argv)
 	struct bladerf_devinfo *devs;
 	struct sigaction sigact;
 	struct devinfo_s device;
-	int show_help = false;
+	bool show_help = false;
 	int n, ret;
-	char ch;
+	int ch;
 	struct cb_s *cb;
 	struct buffer_s *buf;
 	pthread_t reader;
@@ -323,6 +340,7 @@ int main(int argc, char **argv)
 	buf->num_transfers = 0;
 
 	cb->size = DEFAULT_CB_SIZE;
+	cb->r_size = DEFAULT_READ_BLOCKSIZE;
 	cb->r = 0;
 	cb->w = 0;
 	pthread_mutex_init(&cb->lock, NULL);
@@ -332,22 +350,23 @@ int main(int argc, char **argv)
 	pthread_cond_init(&cb->f_cond, NULL);
 
 	/* Evaluate command line options */
-	while((ch = getopt(argc, argv, "hd:f:r:b:g:G:a:m:n:p:s:t:")) != -1)
+	while((ch = getopt(argc, argv, "hd:f:r:b:g:G:a:m:n:p:s:t:R:")) != -1)
 	{
 		switch(ch)
 		{
 			case 'd': device.device_id = optarg; break;
-			case 'f': device.frequency = atoi(optarg); break;
-			case 'r': device.samplerate = atoi(optarg); break;
-			case 'b': device.bandwidth = atoi(optarg); break;
+			case 'f': device.frequency = (unsigned int)atoi(optarg); break;
+			case 'r': device.samplerate = (unsigned int)atoi(optarg); break;
+			case 'b': device.bandwidth = (unsigned int)atoi(optarg); break;
 			case 'g': device.txvga1 = atoi(optarg); break;
 			case 'G': device.txvga2 = atoi(optarg); break;
-			case 'm': buf->gain = atof(optarg); break;
-			case 'a': buf->again = atof(optarg); break;
-			case 'p': cb->size = atof(optarg); break;
-			case 'n': buf->num_buffers = atoi(optarg); break;
-			case 's': buf->num_samples = atoi(optarg); break;
-			case 't': buf->num_transfers = atoi(optarg); break;
+			case 'm': buf->gain = (float)atof(optarg); break;
+			case 'a': buf->again = (float)atof(optarg); break;
+			case 'p': cb->size = (unsigned int)atoi(optarg); break;
+			case 'n': buf->num_buffers = (unsigned int)atoi(optarg); break;
+			case 's': buf->num_samples = (unsigned int)atoi(optarg); break;
+			case 't': buf->num_transfers = (unsigned int)atoi(optarg); break;
+			case 'R': cb->r_size = (unsigned int)atoi(optarg); break;
 			case 'h':
 			default:
 				show_help = true;
@@ -399,7 +418,7 @@ int main(int argc, char **argv)
 			"Serial:\t%s\n"
 			"USB bus:\t%i\n"
 			"USB address:\t%i\n"
-			"Instance:\t%i\n\n",
+			"Instance:\t%u\n\n",
 			devs[n].serial,
 			devs[n].usb_bus,
 			devs[n].usb_addr,
@@ -409,29 +428,6 @@ int main(int argc, char **argv)
 
 	/* the list is not needed any more */
 	bladerf_free_device_list(devs);
-
-	
-	/* Fire up reader thread */
-	ret = pthread_create(&reader, NULL, reader_proc,
-		(void *)(buf));
-	if(ret)
-	{
-		fprintf(stderr, "Error creating reader thread.\n");
-		goto out2;
-	}
-	else
-	{
-		fprintf(stderr, "Reader thread fired up.\n");
-	}
-
-	fprintf(stderr, "Waiting for buffer to fill up.\n");
-
-	while(!state && (cb->w != (cb->r ^ cb->size)))
-		usleep(100000);
-
-	if(state & (STATE_EXIT | STATE_FINISHED))
-		goto out0;
-
 
 
 	/* Open a device by given device string
@@ -449,18 +445,41 @@ int main(int argc, char **argv)
 			device.device_id);
 	}
 
+	
+	/* Fire up reader thread */
+	ret = pthread_create(&reader, NULL, reader_proc,
+		(void *)(buf));
+	if(ret)
+	{
+		fprintf(stderr, "Error creating reader thread.\n");
+		goto out1;
+	}
+	else
+	{
+		fprintf(stderr, "Reader thread fired up.\n");
+	}
+
+	fprintf(stderr, "Waiting for buffer to fill up.\n");
+
+	while(!state && (cb->w != (cb->r ^ cb->size)))
+		usleep(100000);
+
+	if(state & (STATE_EXIT | STATE_FINISHED))
+		goto out1;
+
+
 	/* Set the device parameters */
 	ret = bladerf_set_sample_rate(device.dev,
 		BLADERF_MODULE_TX, device.samplerate, &device.samplerate);
 	if(ret != 0)
 	{
-		fprintf(stderr, "Error setting sample rate to %i: %s.\n",
+		fprintf(stderr, "Error setting sample rate to %u: %s.\n",
 			device.samplerate, bladerf_strerror(ret));
 		goto out1;
 	}
 	else
 	{
-		fprintf(stderr, "Actual sample rate is %i.\n",
+		fprintf(stderr, "Actual sample rate is %u.\n",
 			device.samplerate);
 	}
 
@@ -468,13 +487,13 @@ int main(int argc, char **argv)
 		BLADERF_MODULE_TX, device.frequency);
 	if(ret != 0)
 	{
-		fprintf(stderr, "Error setting frequency to %iHz: %s.\n",
+		fprintf(stderr, "Error setting frequency to %uHz: %s.\n",
 			device.frequency, bladerf_strerror(ret));
 		goto out1;
 	}
 	else
 	{
-		fprintf(stderr, "Frequency set to %iHz.\n", device.frequency);
+		fprintf(stderr, "Frequency set to %uHz.\n", device.frequency);
 	}
 
 	ret = bladerf_set_txvga1(device.dev, device.txvga1);
@@ -503,7 +522,7 @@ int main(int argc, char **argv)
 	}
 	else
 	{
-		fprintf(stderr, "Bandwidth set to %iHz.\n", device.bandwidth);
+		fprintf(stderr, "Bandwidth set to %uHz.\n", device.bandwidth);
 	}
 
 	/* Set up the sample stream */
