@@ -43,7 +43,8 @@ struct cb_s
 	float *fbuf;					/* float buffer for conversion */
 	unsigned int size;				/* Number of elements */
 	unsigned int r_size;			/* Blocksize for fread() */
-	pthread_mutex_t lock;			/* For locking changes in r/w pointers */
+	pthread_mutex_t r_lock;			/* For locking changes in r pointer */
+	pthread_mutex_t w_lock;			/* For locking changes in w pointer */
 	pthread_cond_t e_cond;			/* Empty condition */
 	pthread_cond_t f_cond;			/* Full condition */
 	pthread_mutex_t e_cond_lock;
@@ -163,9 +164,9 @@ static void *stream_callback(
 	}
 	
 	/* Get write pointer for comparison in a safe way */
-	pthread_mutex_lock(&cb->lock);
+	pthread_mutex_lock(&cb->w_lock);
 	tmp_w = cb->w;
-	pthread_mutex_unlock(&cb->lock);
+	pthread_mutex_unlock(&cb->w_lock);
 
 	/* Check if empty */
 	if(tmp_w == cb->r)
@@ -196,9 +197,9 @@ static void *stream_callback(
 	buf->pos = (buf->pos + 1) % buf->num_buffers;
 
 	/* Advance input ring pointer */
-	pthread_mutex_lock(&cb->lock);
+	pthread_mutex_lock(&cb->r_lock);
 	cb->r = (cb->r + 1) & (2 * cb->size - 1);
-	pthread_mutex_unlock(&cb->lock);
+	pthread_mutex_unlock(&cb->r_lock);
 
 	/* Signal that buffer is now filled again */
 	pthread_cond_signal(&cb->f_cond);
@@ -225,9 +226,9 @@ static void *reader_proc(void *arg)
 	while(!state)
 	{
 		/* Get read pointer in a safe way */
-		pthread_mutex_lock(&cb->lock);
+		pthread_mutex_lock(&cb->r_lock);
 		tmp_r = cb->r;
-		pthread_mutex_unlock(&cb->lock);
+		pthread_mutex_unlock(&cb->r_lock);
 
 		/* Check for overflow (full condition)
 		 * Wait until consumer signals a free slot */
@@ -294,9 +295,9 @@ static void *reader_proc(void *arg)
 		}
 		
 		/* Advance write pointer in a safe way */
-		pthread_mutex_lock(&cb->lock);
+		pthread_mutex_lock(&cb->w_lock);
 		cb->w = (cb->w + 1) & (2 * cb->size - 1);
-		pthread_mutex_unlock(&cb->lock);
+		pthread_mutex_unlock(&cb->w_lock);
 
 		/* Signal a full slot */
 		pthread_cond_signal(&cb->e_cond);
@@ -343,7 +344,8 @@ int main(int argc, char **argv)
 	cb->r_size = DEFAULT_READ_BLOCKSIZE;
 	cb->r = 0;
 	cb->w = 0;
-	pthread_mutex_init(&cb->lock, NULL);
+	pthread_mutex_init(&cb->r_lock, NULL);
+	pthread_mutex_init(&cb->w_lock, NULL);
 	pthread_mutex_init(&cb->e_cond_lock, NULL);
 	pthread_mutex_init(&cb->f_cond_lock, NULL);
 	pthread_cond_init(&cb->e_cond, NULL);
