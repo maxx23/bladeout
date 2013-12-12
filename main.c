@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <errno.h>
 #include <signal.h>
 #include <math.h>
 #include <string.h>
@@ -22,6 +23,7 @@
 #define DEFAULT_GAIN		1.f
 #define DEFAULT_AGAIN		0.f
 #define DEFAULT_DEVICE_ID	""
+#define DEFAULT_FILENAME	"-"
 
 #define DEFAULT_READ_BLOCKSIZE	4096
 
@@ -59,6 +61,8 @@ struct buffer_s
 	struct cb_s cb;				/* Circular buffers */
 	float gain;					/* Current soft gain */
 	float again;				/* Auto gain setting */
+	FILE *file;					/* Input file handle */
+	char *fname;				/* Input file name */
 	unsigned int pos;			/* Position in device buffers */
 	unsigned int num_buffers;	/* # slots */
 	unsigned int num_samples;	/* Samples per slot */
@@ -90,6 +94,7 @@ static void usage(char *name, struct devinfo_s *dev)
 	fprintf(stderr, "%s <options>\n"
 		"\t-h\t\tShow this help text.\n"
 		"\t-d <device_id>\tDevice string (current: \"%s\").\n"
+		"\t-i <file>\tInput filename (current: \"%s\").\n"
 		"\t-f <frequency>\tFrequency (current: %uHz).\n"
 		"\t-r <rate>\tSamplerate (current: %u).\n"
 		"\t-b <bandwidth>\tLPF bandwidth (current: %uHz).\n"
@@ -105,6 +110,7 @@ static void usage(char *name, struct devinfo_s *dev)
 		"\n",
 		name,
 		dev->device_id,
+		dev->buffers.fname,
 		dev->frequency,
 		dev->samplerate,
 		dev->bandwidth,
@@ -241,13 +247,13 @@ static void *reader_proc(void *arg)
 
 		/* Read the (float) samples */
 		nread = fread(cb->fbuf, cb->r_size,
-			n_blocks, stdin);
+			n_blocks, buf->file);
 
 		if(nread < n_blocks)
 			fprintf(stderr, "WARNING: Short read.\n");
 		
 		/* Check a few conditions */
-		if(feof(stdin) || ferror(stdin))
+		if(feof(buf->file) || ferror(buf->file))
 		{
 			state |= STATE_FINISHED;
 			break;
@@ -314,7 +320,7 @@ int main(int argc, char **argv)
 	struct sigaction sigact;
 	struct devinfo_s device;
 	bool show_help = false;
-	int n, ret;
+	int n, ret = EXIT_SUCCESS;
 	int ch;
 	struct cb_s *cb;
 	struct buffer_s *buf;
@@ -326,13 +332,14 @@ int main(int argc, char **argv)
 
 	/* Set up default values, bandwidth and num_transfers
 	 * are automatically calculated later */
-	device.device_id = DEFAULT_DEVICE_ID;
+	device.device_id = strdup(DEFAULT_DEVICE_ID);
 	device.frequency = DEFAULT_FREQUENCY;
 	device.samplerate = DEFAULT_SAMPLERATE;
 	device.bandwidth = 0;
 	device.txvga1 = DEFAULT_TXVGA1;
 	device.txvga2 = DEFAULT_TXVGA2;
 
+	buf->fname = strdup(DEFAULT_FILENAME);
 	buf->pos = 0;
 	buf->gain = DEFAULT_GAIN;
 	buf->again = DEFAULT_AGAIN;
@@ -352,11 +359,16 @@ int main(int argc, char **argv)
 	pthread_cond_init(&cb->f_cond, NULL);
 
 	/* Evaluate command line options */
-	while((ch = getopt(argc, argv, "hd:f:r:b:g:G:a:m:n:p:s:t:R:")) != -1)
+	while((ch = getopt(argc, argv, "hd:i:f:r:b:g:G:a:m:n:p:s:t:R:")) != -1)
 	{
 		switch(ch)
 		{
-			case 'd': device.device_id = optarg; break;
+			case 'd': free(device.device_id);
+				device.device_id = strdup(optarg);
+				break;
+			case 'i': free(buf->fname);
+				buf->fname = strdup(optarg);
+				break;
 			case 'f': device.frequency = (unsigned int)atoi(optarg); break;
 			case 'r': device.samplerate = (unsigned int)atoi(optarg); break;
 			case 'b': device.bandwidth = (unsigned int)atoi(optarg); break;
@@ -390,6 +402,20 @@ int main(int argc, char **argv)
 	
 	argc -= optind;
 	argv += optind;
+
+	/* Open input file (if not '-') */
+	if(strncmp("-", buf->fname, 1))
+	{
+		buf->file = fopen(buf->fname, "r");
+		if(buf->file == NULL)
+		{
+			fprintf(stderr, "Error opening input file: %s\n", strerror(errno));
+			return EXIT_FAILURE;
+		}
+	}
+	else
+		buf->file = stdin;
+
 
 	/* Allocate the buffers */
 	cb->data = malloc(cb->size * buf->num_samples * 2 * sizeof(int16_t));
@@ -592,6 +618,6 @@ out0:
 	free(cb->data);
 	free(cb->fbuf);
 
-	return EXIT_SUCCESS;
+	return ret;
 }
 
