@@ -609,12 +609,12 @@ out1:
 	bladerf_close(device.dev);
 	fprintf(stderr, "Device closed.\n");
 	
-out0:
 	pthread_cond_signal(&cb->f_cond);
 	pthread_cond_signal(&cb->e_cond);
 
 	pthread_join(reader, NULL);
 
+out0:
 	free(cb->data);
 	free(cb->fbuf);
 
