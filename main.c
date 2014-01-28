@@ -27,13 +27,16 @@
 
 #define DEFAULT_READ_BLOCKSIZE	4096
 
-/* The conversion loop can be unrolled automatically by the compiler */
-#define UNROLL_FACTOR		8
+/* This helps with loop unrolling and auto vectorization
+ * The higher you set this, the lower your overhead will be */
+#define UNROLL_FACTOR		8192
 
 /* States */
 #define STATE_RUNNING		0
 #define STATE_EXIT			1
 #define STATE_FINISHED		2
+
+
 
 /* Management structure for circular input buffer
  */
@@ -215,6 +218,58 @@ out:
 	return wptr;
 }
 
+float scale_and_autogain(
+		float *__restrict__ in,
+		int16_t *__restrict__ out,
+		float gain,
+		float again)
+{
+	int m;
+	int32_t i_i32, q_i32;
+
+
+	/* Allow for unrolling and auto vectorization */
+	for(m = 0; m < UNROLL_FACTOR; m++)
+	{
+		float i_in = in[m * 2];
+		float q_in = in[m * 2 + 1];
+		
+		/* Multiply by current soft gain */
+		float i = i_in * gain;
+		float q = q_in * gain;
+		
+		/* Calculate (squared) magnitude */
+		float s = i * i + q * q;
+		
+		/* Check if auto gain control is enabled and
+		 * magnitude is over bounds */
+		if((again > 0.0) && (s > (again * again)))
+		{
+			/* Now we need to calculate the sqrt */
+			s = sqrtf(s);
+
+			/* Scale down current gain accordingly */
+			gain = again/s * gain;
+			
+			fprintf(stderr,
+				"WARNING: Soft gain adjusted to %f (%f).\n",
+				gain, s);
+			
+			/* Also correct current samples using the new gain */
+			i = i_in * gain;
+			q = q_in * gain;
+		}
+
+		/* Convert to int16 and write to output buffer */
+		i_i32 = (int32_t)(i * 2047.f);
+		q_i32 = (int32_t)(q * 2047.f);
+
+		out[m * 2] = (int16_t)(i_i32);
+		out[m * 2 + 1] = (int16_t)(q_i32);
+	}
+	
+	return gain;
+}
 
 /* Read, convert and scale input data
  */
@@ -225,7 +280,7 @@ static void *reader_proc(void *arg)
 	unsigned int tmp_r;
 	int16_t *ptr;
 	size_t nread;
-	unsigned int n, m;
+	unsigned int n;
 	const unsigned int n_blocks = sizeof(float) * 2
 		* buf->num_samples / cb->r_size;
 
@@ -265,39 +320,14 @@ static void *reader_proc(void *arg)
 		/* Convert float -> int16 and auto gain control */
 		for(n = 0; n < buf->num_samples; n += UNROLL_FACTOR)
 		{
-			/* Allow for unrolling */
-			for(m = 0; m < UNROLL_FACTOR; m++)
-			{
-				float i_in = cb->fbuf[(n + m) * 2];
-				float q_in = cb->fbuf[(n + m) * 2 + 1];
-				
-				/* Multiply by current soft gain */
-				float i = i_in * buf->gain;
-				float q = q_in * buf->gain;
-				
-				/* Calculate magnitude */
-				float s = sqrtf(i * i + q * q);
-				
-				/* Check if auto gain control is enabled and
-				 * magnitude is over bounds */
-				if((buf->again > 0.0) && (s > buf->again))
-				{
-					/* Scale down current gain accordingly */
-					buf->gain = buf->again/s * buf->gain;
-					
-					fprintf(stderr,
-						"WARNING: Soft gain adjusted to %f (%f).\n",
-						buf->gain, s);
-					
-					/* Also correct current samples using the new gain */
-					i = i_in * buf->gain;
-					q = q_in * buf->gain;
-				}
-
-				/* Convert to int16 and write to output buffer */
-				ptr[(n + m) * 2] = (int16_t)(i * 2047.f);
-				ptr[(n + m) * 2 + 1] = (int16_t)(q * 2047.f);
-			}
+			float *in_ptr = &cb->fbuf[2 * n];
+			int16_t *out_ptr = &ptr[2 * n];
+			
+			buf->gain = scale_and_autogain(
+				in_ptr,
+				out_ptr,
+				buf->gain,
+				buf->again);
 		}
 		
 		/* Advance write pointer in a safe way */
@@ -393,6 +423,12 @@ int main(int argc, char **argv)
 		device.bandwidth = device.samplerate * 3 / 4;
 	if(!buf->num_transfers)
 		buf->num_transfers = buf->num_buffers / 2;
+
+	if(buf->num_samples % UNROLL_FACTOR) {
+		fprintf(stderr, "Number of samples per buffer must be a multiple of %u.\n",
+			UNROLL_FACTOR);
+		return EXIT_FAILURE;
+	}
 
 	if(show_help)
 	{

@@ -4,7 +4,7 @@ TARGET=bladeout
 
 CC=gcc
 
-CFLAGS=-g -O3 -pipe -std=gnu99 -march=native -mtune=native -frename-registers -funroll-loops -ftree-vectorize -Wall -pedantic
+CFLAGS=-O3 -pipe -std=gnu99 -march=native -mtune=native -ffast-math -funsafe-math-optimizations -frename-registers -funroll-loops -ftree-vectorize -ftree-vectorizer-verbose=3 -Wall -pedantic
 CFLAGS+=$(shell pkg-config --cflags libbladeRF)
 
 LDFLAGS=-lpthread -lm -lbladeRF
